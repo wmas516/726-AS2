@@ -38,6 +38,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
         )
         self.rl_agent = account_name_one
         self._prev_battle_state = {}
+        # self._active_damage_multiplier = 1.0
+        # self._opponent_damage_multiplier = 1.0
 
     # =========================================================
     # Action space
@@ -82,21 +84,20 @@ class ShowdownEnvironment(BaseShowdownEnv):
         """
         Combine the move's type effectiveness with the relevant offensive and defensive stat boosts.
         """
-        multiplier = 1.0
-        active = battle.active_pokemon
-        opponent_active = battle.opponent_active_pokemon
+        return self._calculate_damage_multiplier(
+            move, battle.active_pokemon, opponent
+        )
 
-        def stage_multiplier(stage: int) -> float:
-            if stage >= 0:
-                return float((2 + stage) / 2)
-            return float(2 / (2 - stage))
+    def _calculate_damage_multiplier(self, move, attacker, defender) -> float:
+        """Calculate a move's type effectiveness and stat-stage multiplier."""
+        multiplier = 1.0
 
         try:
-            if move.type and opponent.type_1:
+            if move.type and defender.type_1:
                 multiplier = float(
                     move.type.damage_multiplier(
-                        opponent.type_1,
-                        getattr(opponent, "type_2", None),
+                        defender.type_1,
+                        getattr(defender, "type_2", None),
                         type_chart=GEN_DATA.type_chart,
                     )
                 )
@@ -104,18 +105,65 @@ class ShowdownEnvironment(BaseShowdownEnv):
             multiplier = 1.0
 
         move_category = getattr(move.category, "name", str(move.category)).upper()
-        if move_category == "PHYSICAL":
-            multiplier *= stage_multiplier(int(active.boosts.get("atk", 0)) if active is not None else 0)
-            opponent_defense = stage_multiplier(int(opponent_active.boosts.get("def", 0)) if opponent_active is not None else 0)
-            if opponent_defense != 0:
-                multiplier /= opponent_defense
-        elif move_category == "SPECIAL":
-            multiplier *= stage_multiplier(int(active.boosts.get("spa", 0)) if active is not None else 0)
-            opponent_sp_defense = stage_multiplier(int(opponent_active.boosts.get("spd", 0)) if opponent_active is not None else 0)
-            if opponent_sp_defense != 0:
-                multiplier /= opponent_sp_defense
+        multiplier *= self._stat_stage_damage_multiplier(
+            move_category, attacker, defender
+        )
 
         return float(multiplier)
+
+    def _stage_multiplier(stage: int) -> float:
+        """Convert a Pokémon stat stage into its battle multiplier."""
+        if stage >= 0:
+            return float((2 + stage) / 2)
+        return float(2 / (2 - stage))
+
+    def _stat_stage_damage_multiplier(self, category: str, attacker, defender) -> float:
+        """Return the attacker/defender stat-stage ratio for a move category."""
+        if category == "PHYSICAL":
+            attack_stat, defense_stat = "atk", "def"
+        elif category == "SPECIAL":
+            attack_stat, defense_stat = "spa", "spd"
+        else:
+            return 1.0
+
+        attack_stage = int(attacker.boosts.get(attack_stat, 0)) if attacker is not None else 0
+        defense_stage = int(defender.boosts.get(defense_stat, 0)) if defender is not None else 0
+        return self._stage_multiplier(attack_stage) / self._stage_multiplier(defense_stage)
+
+    def _opponent_type_multiplier(self, opponent, target) -> float:
+        """Return the best type matchup the opponent can have against our active Pokémon."""
+        opponent_types = [
+            pokemon_type
+            for pokemon_type in (
+                getattr(opponent, "type_1", None),
+                getattr(opponent, "type_2", None),
+            )
+            if pokemon_type is not None
+        ]
+        if not opponent_types or target.type_1 is None:
+            return 1.0
+
+        physical_boost = self._stat_stage_damage_multiplier("PHYSICAL", opponent, target)
+        special_boost = self._stat_stage_damage_multiplier("SPECIAL", opponent, target)
+        strongest_stat_boost = max(physical_boost, special_boost)
+
+        multipliers = []
+        for attacking_type in opponent_types:
+            try:
+                type_multiplier = float(
+                        attacking_type.damage_multiplier(
+                            target.type_1,
+                            getattr(target, "type_2", None),
+                            type_chart=GEN_DATA.type_chart,
+                        )
+                    )
+                multipliers.append(type_multiplier * strongest_stat_boost)
+            except Exception:
+                continue
+
+        # Type effectiveness and the stronger physical/special stat matchup are
+        # combined; the opponent's two types do not stack because one move is used.
+        return max(multipliers, default=1.0)
 
     # =========================================================
     # Reward Function
@@ -130,7 +178,26 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         if battle is None:
             return 0.0
+        # active_matchup_multiplier = 1.0
+            
+        # if battle.active_pokemon and battle.opponent_active_pokemon:
+        #     active_matchup_multiplier = self._opponent_type_multiplier(
+        #         battle.active_pokemon,
+        #                         battle.opponent_active_pokemon,
+        #                     )
+        active_damage_multiplier = 1.0
+        opponent_damage_multiplier = 1.0
+        if battle.active_pokemon and battle.opponent_active_pokemon:
+            active_damage_multiplier = self._opponent_type_multiplier(
+                battle.active_pokemon,
+                battle.opponent_active_pokemon,
+            )
+            opponent_damage_multiplier = self._opponent_type_multiplier(
+                battle.opponent_active_pokemon,
+                battle.active_pokemon,
+            )
 
+        multDiff = (active_damage_multiplier - opponent_damage_multiplier)
 
         #Current total ally team HP
         ally_hp = np.sum([m.current_hp_fraction for m in battle.team.values()])
@@ -144,7 +211,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
         #Current number of faints on opponent team
         opp_fainted = sum(m.fainted for m in battle.opponent_team.values())
         #Weighted difference of above totals
-        faint_diff = (opp_fainted - ally_fainted) * 2.0
+        faint_diff = (opp_fainted - ally_fainted)
 
         if prior_battle:
             #Last turn total ally team HP
@@ -167,8 +234,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 victory_bonus -= 50.0
 
         # 
-        reward = 1.0 * hp_delta + 0.5 * hp_diff + faint_diff #+ victory_bonus
-        return float(np.clip(reward, -20.0, 20.0) + victory_bonus)
+        reward = multDiff + (1.0 * hp_delta) + (0.5 * hp_diff) + (6.0 * faint_diff) #+ victory_bonus
+        return float(np.clip(reward, -40.0, 40.0) + victory_bonus)
 
     # =========================================================
     # Observation space
@@ -180,9 +247,12 @@ class ShowdownEnvironment(BaseShowdownEnv):
             4x type multipliers
             2x (ally_fainted/6, opp_fainted/6)
             2x (ally_total_hp, opp_total_hp)
-        = 12 features
+            1x best opponent type/stat multiplier vs. active ally
+            5x opponent type/stat multipliers vs. available switches
+            5x best known move multipliers for available switches
+        = 23 features
         """
-        return 12
+        return 23
 
         # Current State Value
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
@@ -206,6 +276,24 @@ class ShowdownEnvironment(BaseShowdownEnv):
             moves_base_power[i] = float((move.base_power or 0) / 100.0)
             moves_dmg_multiplier[i] = self._move_damage_multiplier(battle, move, opp)
 
+        opponent_dmg_multiplier = self._opponent_type_multiplier(opp, active)
+
+        # Keep five fixed switch slots so the observation shape is stable.
+        # Unavailable slots use neutral multipliers.
+        switch_threat_multipliers = np.ones(5, dtype=np.float32)
+        switch_best_move_multipliers = np.ones(5, dtype=np.float32)
+        for i, switch in enumerate(battle.available_switches[:5]):
+            switch_threat_multipliers[i] = self._opponent_type_multiplier(opp, switch)
+            switch_moves = getattr(switch, "moves", {}).values()
+            switch_best_move_multipliers[i] = max(
+                (
+                    self._calculate_damage_multiplier(move, switch, opp)
+                    for move in switch_moves
+                    if getattr(move, "base_power", 0) > 0
+                ),
+                default=1.0,
+            )
+
         ally_hp_total = np.sum([m.current_hp_fraction for m in battle.team.values()]) / 6.0
         opp_hp_total = np.sum([m.current_hp_fraction for m in battle.opponent_team.values()]) / 6.0
         ally_fainted = len([m for m in battle.team.values() if m.fainted]) / 6.0
@@ -215,6 +303,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
             moves_base_power,
             moves_dmg_multiplier,
             np.array([ally_fainted, opp_fainted, ally_hp_total, opp_hp_total], dtype=np.float32),
+            np.array([opponent_dmg_multiplier], dtype=np.float32),
+            switch_threat_multipliers,
+            switch_best_move_multipliers,
         ])
 
         return obs.astype(np.float32)
@@ -228,6 +319,8 @@ class ShowdownEnvironment(BaseShowdownEnv):
             agent = self.possible_agents[0]
             info[agent]["win"] = self.battle1.won
             info[agent]["turns"] = self.battle1.turn
+            info[agent]["active_damage_multiplier"] = self._active_damage_multiplier
+            info[agent]["opponent_damage_multiplier"] = self._opponent_damage_multiplier
         return info
 
 
