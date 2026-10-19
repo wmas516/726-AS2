@@ -20,6 +20,43 @@ from poke_env.data import GenData
 # Load Gen9 data (type chart etc.)
 GEN_DATA = GenData.from_gen(9)
 
+_BATTLE_STATS = ("atk", "def", "spa", "spd", "spe", "accuracy", "evasion")
+_STATUS_EFFECTS = ("brn", "par", "psn", "tox", "slp", "frz")
+
+
+def _boost_multiplier(stage: int, *, accuracy: bool = False) -> float:
+    """Convert a Pokémon stat stage (-6..6) to its in-battle multiplier."""
+    stage = max(-6, min(6, int(stage)))
+    if accuracy:
+        return (3 + stage) / 3 if stage >= 0 else 3 / (3 - stage)
+    return (2 + stage) / 2 if stage >= 0 else 2 / (2 - stage)
+
+
+def _condition_name(value) -> str:
+    """Normalize poke-env enums and strings for condition lookup."""
+    return str(getattr(value, "name", value)).lower().replace("_", "").split(".")[-1]
+
+
+def _status_embedding(pokemon) -> np.ndarray:
+    """One-hot encode the active Pokémon's major status condition."""
+    features = np.zeros(len(_STATUS_EFFECTS), dtype=np.float32)
+    status = getattr(pokemon, "status", None)
+    if status is None:
+        return features
+    name = _condition_name(status)
+    aliases = {
+        "burn": "brn", "burned": "brn",
+        "paralysis": "par", "paralyzed": "par",
+        "poison": "psn", "poisoned": "psn",
+        "toxic": "tox", "badlypoisoned": "tox",
+        "sleep": "slp", "asleep": "slp",
+        "freeze": "frz", "frozen": "frz",
+    }
+    name = aliases.get(name, name)
+    if name in _STATUS_EFFECTS:
+        features[_STATUS_EFFECTS.index(name)] = 1.0
+    return features
+
 
 class ShowdownEnvironment(BaseShowdownEnv):
 
@@ -111,6 +148,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         return float(multiplier)
 
+    @staticmethod
     def _stage_multiplier(stage: int) -> float:
         """Convert a Pokémon stat stage into its battle multiplier."""
         if stage >= 0:
@@ -129,6 +167,156 @@ class ShowdownEnvironment(BaseShowdownEnv):
         attack_stage = int(attacker.boosts.get(attack_stat, 0)) if attacker is not None else 0
         defense_stage = int(defender.boosts.get(defense_stat, 0)) if defender is not None else 0
         return self._stage_multiplier(attack_stage) / self._stage_multiplier(defense_stage)
+
+    def _stat_effect_potential(self, battle: AbstractBattle | None) -> float:
+        """Value active stat changes in the context of the current matchup."""
+        if battle is None or not battle.active_pokemon or not battle.opponent_active_pokemon:
+            return 0.0
+
+        ally = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        ally_moves = list(getattr(battle, "available_moves", []) or [])
+        opponent_moves = list((getattr(opponent, "moves", {}) or {}).values())
+
+        def relevant_categories(moves):
+            categories = {
+                getattr(getattr(move, "category", None), "name", "").upper()
+                for move in moves
+                if getattr(move, "base_power", 0) > 0
+            }
+            categories.intersection_update({"PHYSICAL", "SPECIAL"})
+            return categories or {"PHYSICAL", "SPECIAL"}
+
+        ally_offense = max(
+            self._stat_stage_damage_multiplier(category, ally, opponent)
+            for category in relevant_categories(ally_moves)
+        )
+        opponent_offense = max(
+            self._stat_stage_damage_multiplier(category, opponent, ally)
+            for category in relevant_categories(opponent_moves)
+        )
+
+        ally_boosts = getattr(ally, "boosts", None) or {}
+        opponent_boosts = getattr(opponent, "boosts", None) or {}
+        # Speed and accuracy/evasion are not represented by damage ratios above.
+        speed_edge = np.log(
+            _boost_multiplier(ally_boosts.get("spe", 0))
+            / _boost_multiplier(opponent_boosts.get("spe", 0))
+        )
+        accuracy_edge = np.log(
+            _boost_multiplier(ally_boosts.get("accuracy", 0), accuracy=True)
+            / _boost_multiplier(opponent_boosts.get("evasion", 0), accuracy=True)
+        )
+        return float(ally_offense - opponent_offense + 0.25 * speed_edge + 0.15 * accuracy_edge)
+
+    @staticmethod
+    def _status_potential(battle: AbstractBattle | None) -> float:
+        """Reward useful opponent status conditions once, while they persist."""
+        if battle is None:
+            return 0.0
+        weights = {
+            "brn": 0.6, "burn": 0.6,
+            "par": 0.7, "paralysis": 0.7,
+            "psn": 0.35, "poison": 0.35,
+            "tox": 0.65, "toxic": 0.65,
+            "slp": 0.9, "sleep": 0.9,
+            "frz": 0.9, "freeze": 0.9,
+        }
+        total = 0.0
+        for pokemon in (getattr(battle, "opponent_team", {}) or {}).values():
+            status = getattr(pokemon, "status", None)
+            if status is not None:
+                total += weights.get(_condition_name(status), 0.0)
+        return total
+
+    @staticmethod
+    def _condition_value(conditions, name: str, max_layers: int = 1) -> float:
+        for condition, value in (conditions or {}).items():
+            if _condition_name(condition) == name:
+                if value is False:
+                    return 0.0
+                try:
+                    count = float(value)
+                except (TypeError, ValueError):
+                    count = 1.0
+                if count <= 0:
+                    return 0.0
+                return min(float(max_layers), max(1.0, count))
+        return 0.0
+
+    @staticmethod
+    def _grounded_hazard_coverage(battle: AbstractBattle, *, toxic: bool = False) -> float:
+        known_opponents = list((getattr(battle, "opponent_team", {}) or {}).values())
+        if not known_opponents:
+            return 0.5  # Team is mostly hidden at the start of random battles.
+
+        affected = 0
+        for pokemon in known_opponents:
+            grounded = getattr(pokemon, "is_grounded", None)
+            if grounded is None:
+                types = {
+                    _condition_name(getattr(pokemon, type_attr, ""))
+                    for type_attr in ("type_1", "type_2")
+                }
+                ability = _condition_name(getattr(pokemon, "ability", ""))
+                grounded = "flying" not in types and ability != "levitate"
+            if toxic and ("steel" in {
+                _condition_name(getattr(pokemon, attr, "")) for attr in ("type_1", "type_2")
+            } or "poison" in {
+                _condition_name(getattr(pokemon, attr, "")) for attr in ("type_1", "type_2")
+            }):
+                continue
+            affected += bool(grounded)
+        unknown_slots = max(0, 6 - len(known_opponents))
+        # Estimate unknown team members at 50% susceptibility, then use exact
+        # susceptibility for the opponents already revealed.
+        return (affected + 0.5 * unknown_slots) / 6
+
+    @classmethod
+    def _field_effect_potential(cls, battle: AbstractBattle | None) -> float:
+        """Value useful hazards, screens, and speed control currently in play."""
+        if battle is None:
+            return 0.0
+        own = getattr(battle, "side_conditions", {}) or {}
+        opponent = getattr(battle, "opponent_side_conditions", {}) or {}
+
+        potential = 0.0
+        # Hazards are valued by their layers and estimated coverage of the
+        # opponent's known team. Stealth Rock can affect any known team member.
+        known_opponents = len(getattr(battle, "opponent_team", {}) or {})
+        rock_coverage = (known_opponents + 0.75 * max(0, 6 - known_opponents)) / 6
+        potential += 0.45 * cls._condition_value(opponent, "stealthrock") * rock_coverage
+        potential += 0.30 * cls._condition_value(opponent, "spikes", 3) * cls._grounded_hazard_coverage(battle)
+        potential += 0.30 * cls._condition_value(opponent, "toxicspikes", 2) * cls._grounded_hazard_coverage(battle, toxic=True)
+        potential += 0.40 * cls._condition_value(opponent, "stickyweb") * cls._grounded_hazard_coverage(battle)
+
+        # These are our side conditions: defenses and speed control for our team.
+        potential += 0.35 * cls._condition_value(own, "reflect")
+        potential += 0.35 * cls._condition_value(own, "lightscreen")
+        potential += 0.50 * cls._condition_value(own, "auroraveil")
+        potential += 0.45 * cls._condition_value(own, "tailwind")
+        return potential
+
+    @staticmethod
+    def _hazard_entry_bonus(prior_battle, battle, opponent_damage: float) -> float:
+        """Add a small bonus when hazards coincide with a damaging switch-in."""
+        if prior_battle is None or opponent_damage <= 0:
+            return 0.0
+        previous_active = getattr(prior_battle, "opponent_active_pokemon", None)
+        current_active = getattr(battle, "opponent_active_pokemon", None)
+        if previous_active is None or current_active is None:
+            return 0.0
+        previous_species = _condition_name(getattr(previous_active, "species", ""))
+        current_species = _condition_name(getattr(current_active, "species", ""))
+        if not previous_species or previous_species == current_species:
+            return 0.0
+
+        hazards = getattr(battle, "opponent_side_conditions", {}) or {}
+        has_hazards = any(
+            ShowdownEnvironment._condition_value(hazards, name, layers) > 0
+            for name, layers in (("stealthrock", 1), ("spikes", 3), ("toxicspikes", 2), ("stickyweb", 1))
+        )
+        return 0.5 * opponent_damage if has_hazards else 0.0
 
     def _opponent_type_multiplier(self, opponent, target) -> float:
         """Return the best type matchup the opponent can have against our active Pokémon."""
@@ -218,12 +406,36 @@ class ShowdownEnvironment(BaseShowdownEnv):
             prev_ally_hp = np.sum([m.current_hp_fraction for m in prior_battle.team.values()])
             #Last turn total of current known Opponent team HP 
             prev_opp_hp = np.sum([m.current_hp_fraction for m in prior_battle.opponent_team.values()])
-            #Change of hp between turns of opp - ally 
-            # - More + more opp hp lost and/or ally hp gained
-            # - More - less opp hp lost and/or ally hp gained
-            hp_delta = (prev_opp_hp - opp_hp) - (prev_ally_hp - ally_hp)
+            opponent_damage = max(0.0, prev_opp_hp - opp_hp)
+            ally_damage = max(0.0, prev_ally_hp - ally_hp)
+            ally_healing = max(0.0, ally_hp - prev_ally_hp)
+            # Reward each recovered HP-fraction point at 1.25x the value of
+            # dealing one point of damage to the opponent.
+            hp_delta = opponent_damage - ally_damage + 1.25 * ally_healing
+
+            # Potential differences reward useful changes once, rather than
+            # paying repeatedly for effects that persist across turns.
+            stat_bonus = 0.25 * (
+                self._stat_effect_potential(battle)
+                - self._stat_effect_potential(prior_battle)
+            )
+            status_bonus = (
+                self._status_potential(battle)
+                - self._status_potential(prior_battle)
+            )
+            field_bonus = (
+                self._field_effect_potential(battle)
+                - self._field_effect_potential(prior_battle)
+            )
+            hazard_bonus = self._hazard_entry_bonus(
+                prior_battle, battle, opponent_damage
+            )
         else:
             hp_delta = 0.0
+            stat_bonus = 0.0
+            status_bonus = 0.0
+            field_bonus = 0.0
+            hazard_bonus = 0.0
 
         # reward for win / loss
         victory_bonus = 0.0
@@ -234,7 +446,16 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 victory_bonus -= 50.0
 
         # 
-        reward = multDiff + (1.0 * hp_delta) + (0.5 * hp_diff) + (6.0 * faint_diff) #+ victory_bonus
+        reward = (
+            multDiff
+            + hp_delta
+            + (0.5 * hp_diff)
+            + (6.0 * faint_diff)
+            + stat_bonus
+            + status_bonus
+            + field_bonus
+            + hazard_bonus
+        )
         return float(np.clip(reward, -40.0, 40.0) + victory_bonus)
 
     # =========================================================
@@ -245,14 +466,18 @@ class ShowdownEnvironment(BaseShowdownEnv):
         Embedding structure:
             4x base powers
             4x type multipliers
+            7x active ally stat multipliers
+            7x active opponent stat multipliers
+            6x active ally status flags
+            6x active opponent status flags
             2x (ally_fainted/6, opp_fainted/6)
             2x (ally_total_hp, opp_total_hp)
             1x best opponent type/stat multiplier vs. active ally
             5x opponent type/stat multipliers vs. available switches
             5x best known move multipliers for available switches
-        = 23 features
+        = 49 features
         """
-        return 23
+        return 49
 
         # Current State Value
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
@@ -275,6 +500,23 @@ class ShowdownEnvironment(BaseShowdownEnv):
         for i, move in enumerate(battle.available_moves[:4]):
             moves_base_power[i] = float((move.base_power or 0) / 100.0)
             moves_dmg_multiplier[i] = self._move_damage_multiplier(battle, move, opp)
+
+        def stat_multipliers(pokemon) -> np.ndarray:
+            boosts = getattr(pokemon, "boosts", None) or {}
+            return np.asarray(
+                [
+                    _boost_multiplier(
+                        boosts.get(stat, 0), accuracy=stat in ("accuracy", "evasion")
+                    )
+                    for stat in _BATTLE_STATS
+                ],
+                dtype=np.float32,
+            )
+
+        ally_stat_multipliers = stat_multipliers(active)
+        opp_stat_multipliers = stat_multipliers(opp)
+        ally_status = _status_embedding(active)
+        opp_status = _status_embedding(opp)
 
         opponent_dmg_multiplier = self._opponent_type_multiplier(opp, active)
 
@@ -302,6 +544,10 @@ class ShowdownEnvironment(BaseShowdownEnv):
         obs = np.concatenate([
             moves_base_power,
             moves_dmg_multiplier,
+            ally_stat_multipliers,
+            opp_stat_multipliers,
+            ally_status,
+            opp_status,
             np.array([ally_fainted, opp_fainted, ally_hp_total, opp_hp_total], dtype=np.float32),
             np.array([opponent_dmg_multiplier], dtype=np.float32),
             switch_threat_multipliers,
