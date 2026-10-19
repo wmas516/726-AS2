@@ -89,22 +89,18 @@ class ShowdownEnvironment(BaseShowdownEnv):
 
         This should return the number of actions you wish to use if not using the default action scheme.
         """
-        # Limiting action space to only 5 switches and 4 moves
-        return 9  # default 26-action mapping used by CARES
+        # Keep the first ten Showdown action IDs unchanged: six switch slots
+        # (0-5) and four move slots (6-9).
+        return 10
 
     def process_action(self, action: np.int64) -> np.int64:
         """
         Returns the np.int64 relative to the given action.
 
         The action mapping is as follows:
-        action = -2: default
-        action = -1: forfeit
-        0 - 5 : switch
-        6 - 9: move
-        10 - 13: move and mega evolve
-        14 - 17: move and z-move
-        18 - 21: move and dynamax
-        22 - 25: move and terastallize
+        Actions 0-5 select switch slots and actions 6-9 select moves, matching
+        the underlying Showdown action IDs. Negative and out-of-range values
+        select the default action.
 
         :param action: The action to take.
         :type action: int64
@@ -112,10 +108,10 @@ class ShowdownEnvironment(BaseShowdownEnv):
         :return: The battle order ID for the given action in context of the current battle.
         :rtype: np.Int64
         """
-        # Limiting action space to only 5 switches and 4 moves
-        if (action >=  10 or action > 0): 
-            return (-2)
-        return action
+        action = int(action)
+        if action < 0 or action >= 10:
+            return np.int64(-2)
+        return np.int64(action)
 
     def _move_damage_multiplier(self, battle: AbstractBattle, move, opponent) -> float:
         """
@@ -126,7 +122,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
         )
 
     def _calculate_damage_multiplier(self, move, attacker, defender) -> float:
-        """Calculate a move's type effectiveness and stat-stage multiplier."""
+        """Calculate expected damage multiplier, including effective accuracy."""
         multiplier = 1.0
 
         try:
@@ -145,6 +141,30 @@ class ShowdownEnvironment(BaseShowdownEnv):
         multiplier *= self._stat_stage_damage_multiplier(
             move_category, attacker, defender
         )
+
+        # Poke-env move accuracy is generally expressed as a percentage. Treat
+        # missing/boolean accuracy as always-hit, and account for accuracy and
+        # evasion stages when estimating the chance that the move connects.
+        accuracy = getattr(move, "accuracy", None)
+        if accuracy is None or isinstance(accuracy, (bool, np.bool_)):
+            hit_probability = 1.0
+        else:
+            accuracy = float(accuracy)
+            base_hit_probability = accuracy / 100.0 if accuracy > 1.0 else accuracy
+            attacker_boosts = getattr(attacker, "boosts", None) or {}
+            defender_boosts = getattr(defender, "boosts", None) or {}
+            accuracy_multiplier = _boost_multiplier(
+                attacker_boosts.get("accuracy", 0), accuracy=True
+            )
+            evasion_multiplier = _boost_multiplier(
+                defender_boosts.get("evasion", 0), accuracy=True
+            )
+            hit_probability = np.clip(
+                base_hit_probability * accuracy_multiplier / evasion_multiplier,
+                0.0,
+                1.0,
+            )
+        multiplier *= float(hit_probability)
 
         return float(multiplier)
 
@@ -353,6 +373,56 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # combined; the opponent's two types do not stack because one move is used.
         return max(multipliers, default=1.0)
 
+    def _battle_potential(self, battle: AbstractBattle | None) -> float:
+        """Estimate battle advantage for small, discounted reward shaping."""
+        if battle is None:
+            return 0.0
+        ally_fainted = sum(m.fainted for m in battle.team.values())
+        opp_fainted = sum(m.fainted for m in battle.opponent_team.values())
+        faint_advantage = 0.5 * (opp_fainted - ally_fainted)
+        tactical_advantage = (
+            0.25 * self._stat_effect_potential(battle)
+            + 0.5 * self._status_potential(battle)
+            + 0.25 * self._field_effect_potential(battle)
+        )
+        matchup_advantage = self._active_matchup_potential(battle)
+        return float(faint_advantage + tactical_advantage + matchup_advantage)
+
+    def _active_matchup_potential(self, battle: AbstractBattle) -> float:
+        """Value a favorable active matchup, most when both Pokémon are healthy."""
+        ally = getattr(battle, "active_pokemon", None)
+        opponent = getattr(battle, "opponent_active_pokemon", None)
+        if ally is None or opponent is None:
+            return 0.0
+
+        ally_moves = list(getattr(battle, "available_moves", []) or [])
+        if not ally_moves:
+            ally_moves = list((getattr(ally, "moves", {}) or {}).values())
+        opponent_moves = list((getattr(opponent, "moves", {}) or {}).values())
+
+        def best_damage_multiplier(attacker, defender, moves):
+            return max(
+                (
+                    self._calculate_damage_multiplier(move, attacker, defender)
+                    for move in moves
+                    if getattr(move, "base_power", 0) > 0
+                ),
+                default=1.0,
+            )
+
+        ally_attack = best_damage_multiplier(ally, opponent, ally_moves)
+        opponent_attack = best_damage_multiplier(opponent, ally, opponent_moves)
+        if not opponent_moves:
+            opponent_attack = self._opponent_type_multiplier(opponent, ally)
+
+        matchup_ratio = max(ally_attack, 1e-6) / max(opponent_attack, 1e-6)
+        matchup_score = float(np.clip(np.log2(matchup_ratio), -2.0, 2.0))
+        health_weight = min(
+            float(getattr(ally, "current_hp_fraction", 0.0)),
+            float(getattr(opponent, "current_hp_fraction", 0.0)),
+        )
+        return 2.0 * health_weight * matchup_score
+
     # =========================================================
     # Reward Function
     # =========================================================
@@ -362,101 +432,62 @@ class ShowdownEnvironment(BaseShowdownEnv):
         Reward based on HP, fainted Pokémon, and victory outcomes.
         Inspired by SimpleRLPlayer reward_computing_helper.
         """
-        prior_battle = self._get_prior_battle(battle)
-
         if battle is None:
             return 0.0
-        # active_matchup_multiplier = 1.0
-            
-        # if battle.active_pokemon and battle.opponent_active_pokemon:
-        #     active_matchup_multiplier = self._opponent_type_multiplier(
-        #         battle.active_pokemon,
-        #                         battle.opponent_active_pokemon,
-        #                     )
-        active_damage_multiplier = 1.0
-        opponent_damage_multiplier = 1.0
-        if battle.active_pokemon and battle.opponent_active_pokemon:
-            active_damage_multiplier = self._opponent_type_multiplier(
-                battle.active_pokemon,
-                battle.opponent_active_pokemon,
-            )
-            opponent_damage_multiplier = self._opponent_type_multiplier(
-                battle.opponent_active_pokemon,
-                battle.active_pokemon,
-            )
-
-        multDiff = (active_damage_multiplier - opponent_damage_multiplier)
-
-        #Current total ally team HP
-        ally_hp = np.sum([m.current_hp_fraction for m in battle.team.values()])
-        #Current total of current known opponent team HP
-        opp_hp = np.sum([m.current_hp_fraction for m in battle.opponent_team.values()])
-        #Weighted difference of above totals
-        hp_diff = ally_hp - opp_hp
-
-        #Current number of faints on allied team
-        ally_fainted = sum(m.fainted for m in battle.team.values())
-        #Current number of faints on opponent team
-        opp_fainted = sum(m.fainted for m in battle.opponent_team.values())
-        #Weighted difference of above totals
-        faint_diff = (opp_fainted - ally_fainted)
-
+        prior_battle = self._get_prior_battle(battle)
         if prior_battle:
-            #Last turn total ally team HP
-            prev_ally_hp = np.sum([m.current_hp_fraction for m in prior_battle.team.values()])
-            #Last turn total of current known Opponent team HP 
-            prev_opp_hp = np.sum([m.current_hp_fraction for m in prior_battle.opponent_team.values()])
-            opponent_damage = max(0.0, prev_opp_hp - opp_hp)
-            ally_damage = max(0.0, prev_ally_hp - ally_hp)
-            ally_healing = max(0.0, ally_hp - prev_ally_hp)
-            # Reward each recovered HP-fraction point at 1.25x the value of
-            # dealing one point of damage to the opponent.
-            hp_delta = opponent_damage - ally_damage + 1.25 * ally_healing
+            # Keep gamma aligned with the DoubleDQN configuration (0.99).
+            # Scaling the potential keeps shaping small relative to the outcome.
+            next_potential = 0.0 if battle.finished else self._battle_potential(battle)
+            battle_progress = 0.25 * (
+                0.99 * next_potential - self._battle_potential(prior_battle)
+            )
 
-            # Potential differences reward useful changes once, rather than
-            # paying repeatedly for effects that persist across turns.
-            stat_bonus = 0.25 * (
-                self._stat_effect_potential(battle)
-                - self._stat_effect_potential(prior_battle)
+            def hp_change(previous_team, current_team, *, known_members_only=False):
+                previous = previous_team or {}
+                current = current_team or {}
+                keys = current.keys() & previous.keys() if known_members_only else current.keys()
+                return sum(
+                    current[key].current_hp_fraction
+                    - previous[key].current_hp_fraction
+                    for key in keys
+                )
+
+            ally_hp_change = hp_change(prior_battle.team, battle.team)
+            # Opponent teams are only revealed gradually; compare shared members
+            # so a newly revealed full-health Pokémon is not mistaken for healing.
+            opponent_hp_change = hp_change(
+                prior_battle.opponent_team,
+                battle.opponent_team,
+                known_members_only=True,
             )
-            status_bonus = (
-                self._status_potential(battle)
-                - self._status_potential(prior_battle)
-            )
-            field_bonus = (
-                self._field_effect_potential(battle)
-                - self._field_effect_potential(prior_battle)
-            )
-            hazard_bonus = self._hazard_entry_bonus(
-                prior_battle, battle, opponent_damage
+            # Reward favorable damage trades directly and penalize self-damage,
+            # including HP spent on moves such as Substitute.
+            damage_exchange_reward = float(
+                np.clip(2.0 * (ally_hp_change - opponent_hp_change), -4.0, 4.0)
             )
         else:
-            hp_delta = 0.0
-            stat_bonus = 0.0
-            status_bonus = 0.0
-            field_bonus = 0.0
-            hazard_bonus = 0.0
+            battle_progress = 0.0
+            damage_exchange_reward = 0.0
+
+        # Charge every action a small time cost to discourage unnecessarily
+        # long battles, including turns where the state does not change.
+        step_cost = -0.1
 
         # reward for win / loss
         victory_bonus = 0.0
         if battle.finished:
             if battle.won:
-                victory_bonus += 1000.0
+                victory_bonus += 100.0
             elif battle.lost:
-                victory_bonus -= 50.0
+                victory_bonus -= 100.0
 
-        # 
-        reward = (
-            multDiff
-            + hp_delta
-            + (0.5 * hp_diff)
-            + (6.0 * faint_diff)
-            + stat_bonus
-            + status_bonus
-            + field_bonus
-            + hazard_bonus
+        return float(
+            np.clip(battle_progress, -10.0, 10.0)
+            + damage_exchange_reward
+            + step_cost
+            + victory_bonus
         )
-        return float(np.clip(reward, -40.0, 40.0) + victory_bonus)
 
     # =========================================================
     # Observation space
