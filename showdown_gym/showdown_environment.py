@@ -510,9 +510,10 @@ class ShowdownEnvironment(BaseShowdownEnv):
             1x best opponent type/stat multiplier vs. active ally
             5x opponent type/stat multipliers vs. available switches
             5x best known move multipliers for available switches
-        = 49 features
+            8x relevant side conditions and hazards
+        = 57 features
         """
-        return 49
+        return 57
 
         # Current State Value
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
@@ -576,6 +577,22 @@ class ShowdownEnvironment(BaseShowdownEnv):
         ally_fainted = len([m for m in battle.team.values() if m.fainted]) / 6.0
         opp_fainted = len([m for m in battle.opponent_team.values() if m.fainted]) / 6.0
 
+        own_conditions = getattr(battle, "side_conditions", {}) or {}
+        opponent_conditions = getattr(battle, "opponent_side_conditions", {}) or {}
+        field_effects = np.asarray(
+            [
+                self._condition_value(own_conditions, "reflect"),
+                self._condition_value(own_conditions, "lightscreen"),
+                self._condition_value(own_conditions, "auroraveil"),
+                self._condition_value(own_conditions, "tailwind"),
+                self._condition_value(opponent_conditions, "stealthrock"),
+                self._condition_value(opponent_conditions, "spikes", 3) / 3.0,
+                self._condition_value(opponent_conditions, "toxicspikes", 2) / 2.0,
+                self._condition_value(opponent_conditions, "stickyweb"),
+            ],
+            dtype=np.float32,
+        )
+
         obs = np.concatenate([
             moves_base_power,
             moves_dmg_multiplier,
@@ -587,6 +604,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
             np.array([opponent_dmg_multiplier], dtype=np.float32),
             switch_threat_multipliers,
             switch_best_move_multipliers,
+            field_effects,
         ])
 
         return obs.astype(np.float32)
