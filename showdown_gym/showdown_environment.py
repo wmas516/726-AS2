@@ -75,6 +75,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
         )
         self.rl_agent = account_name_one
         self._prev_battle_state = {}
+        self._last_action = None
         # self._active_damage_multiplier = 1.0
         # self._opponent_damage_multiplier = 1.0
 
@@ -110,7 +111,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
         """
         action = int(action)
         if action < 0 or action >= 10:
+            self._last_action = None
             return np.int64(-2)
+        self._last_action = action
         return np.int64(action)
 
     def _move_damage_multiplier(self, battle: AbstractBattle, move, opponent) -> float:
@@ -389,7 +392,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
         return float(faint_advantage + tactical_advantage + matchup_advantage)
 
     def _active_matchup_potential(self, battle: AbstractBattle) -> float:
-        """Value a favorable active matchup, most when both Pokémon are healthy."""
+        """Value a favorable active matchup using approximate expected damage."""
         ally = getattr(battle, "active_pokemon", None)
         opponent = getattr(battle, "opponent_active_pokemon", None)
         if ally is None or opponent is None:
@@ -400,20 +403,21 @@ class ShowdownEnvironment(BaseShowdownEnv):
             ally_moves = list((getattr(ally, "moves", {}) or {}).values())
         opponent_moves = list((getattr(opponent, "moves", {}) or {}).values())
 
-        def best_damage_multiplier(attacker, defender, moves):
+        def best_expected_damage(attacker, defender, moves):
             return max(
                 (
-                    self._calculate_damage_multiplier(move, attacker, defender)
+                    float(getattr(move, "base_power", 0) or 0)
+                    * self._calculate_damage_multiplier(move, attacker, defender)
                     for move in moves
                     if getattr(move, "base_power", 0) > 0
                 ),
-                default=1.0,
+                default=100.0,
             )
 
-        ally_attack = best_damage_multiplier(ally, opponent, ally_moves)
-        opponent_attack = best_damage_multiplier(opponent, ally, opponent_moves)
+        ally_attack = best_expected_damage(ally, opponent, ally_moves)
+        opponent_attack = best_expected_damage(opponent, ally, opponent_moves)
         if not opponent_moves:
-            opponent_attack = self._opponent_type_multiplier(opponent, ally)
+            opponent_attack = 100.0 * self._opponent_type_multiplier(opponent, ally)
 
         matchup_ratio = max(ally_attack, 1e-6) / max(opponent_attack, 1e-6)
         matchup_score = float(np.clip(np.log2(matchup_ratio), -2.0, 2.0))
@@ -422,6 +426,79 @@ class ShowdownEnvironment(BaseShowdownEnv):
             float(getattr(opponent, "current_hp_fraction", 0.0)),
         )
         return 2.0 * health_weight * matchup_score
+
+    @staticmethod
+    def _battle_effect_signature(battle: AbstractBattle):
+        """Capture persistent effects that indicate a move changed the battle."""
+        def team_effects(team):
+            effects = {}
+            for key, pokemon in (team or {}).items():
+                effects[key] = (
+                    _condition_name(getattr(pokemon, "status", None)),
+                    tuple(sorted((str(k), int(v)) for k, v in (getattr(pokemon, "boosts", {}) or {}).items())),
+                    tuple(sorted(_condition_name(v) for v in (getattr(pokemon, "effects", {}) or {}).keys())),
+                )
+            return effects
+
+        def conditions(values):
+            return tuple(sorted(
+                (_condition_name(key), str(value))
+                for key, value in (values or {}).items()
+            ))
+
+        return (
+            team_effects(getattr(battle, "team", {})),
+            team_effects(getattr(battle, "opponent_team", {})),
+            conditions(getattr(battle, "side_conditions", {})),
+            conditions(getattr(battle, "opponent_side_conditions", {})),
+        )
+
+    def _last_move_had_no_effect(self, prior_battle, battle) -> bool:
+        """Detect a move with no observable battle effect, regardless of category."""
+        action = self._last_action
+        if action is None or not 6 <= action <= 9:
+            return False
+        moves = list(getattr(prior_battle, "available_moves", []) or [])
+        move_index = action - 6
+        if move_index >= len(moves):
+            return False
+
+        # New status, stat stage, volatile, or side-condition effects count for
+        # any move category (including secondary effects from attacks).
+        if self._battle_effect_signature(prior_battle) != self._battle_effect_signature(battle):
+            return False
+
+        # Damage moves are effective when they lower the same active target's
+        # HP. Ignore a different opponent active Pokémon to avoid crediting a
+        # newly switched-in Pokémon's starting HP as an effect.
+        previous_opponent = getattr(prior_battle, "opponent_active_pokemon", None)
+        current_opponent = getattr(battle, "opponent_active_pokemon", None)
+        if previous_opponent is not None and current_opponent is not None:
+            same_target = (
+                _condition_name(getattr(previous_opponent, "species", ""))
+                == _condition_name(getattr(current_opponent, "species", ""))
+            )
+            if same_target and (
+                current_opponent.current_hp_fraction
+                < previous_opponent.current_hp_fraction
+            ):
+                return False
+
+        # Healing moves count as effective when the active Pokémon recovers HP.
+        previous_active = getattr(prior_battle, "active_pokemon", None)
+        current_active = getattr(battle, "active_pokemon", None)
+        if previous_active is not None and current_active is not None:
+            same_active = (
+                _condition_name(getattr(previous_active, "species", ""))
+                == _condition_name(getattr(current_active, "species", ""))
+            )
+            if same_active and (
+                current_active.current_hp_fraction
+                > previous_active.current_hp_fraction
+            ):
+                return False
+
+        return True
 
     # =========================================================
     # Reward Function
@@ -442,6 +519,30 @@ class ShowdownEnvironment(BaseShowdownEnv):
             battle_progress = 0.25 * (
                 0.99 * next_potential - self._battle_potential(prior_battle)
             )
+
+            # Pay a small continuing reward for maintaining a favorable active
+            # matchup. The potential difference above alone only rewards entry
+            # into that position, not staying in it.
+            matchup_hold_reward = 0.10 * max(
+                0.0, self._active_matchup_potential(battle)
+            )
+
+            # Give an extra one-time nudge when an actual switch improves the
+            # matchup. Fainted/forced switch-ins are excluded by requiring the
+            # outgoing active Pokémon to still be alive.
+            previous_active = getattr(prior_battle, "active_pokemon", None)
+            current_active = getattr(battle, "active_pokemon", None)
+            switch_reward = 0.0
+            if (
+                previous_active is not None
+                and current_active is not None
+                and not getattr(previous_active, "fainted", False)
+                and _condition_name(getattr(previous_active, "species", ""))
+                != _condition_name(getattr(current_active, "species", ""))
+            ):
+                old_matchup = self._active_matchup_potential(prior_battle)
+                new_matchup = self._active_matchup_potential(battle)
+                switch_reward = 0.5 * max(0.0, new_matchup - old_matchup)
 
             def hp_change(previous_team, current_team, *, known_members_only=False):
                 previous = previous_team or {}
@@ -478,6 +579,12 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # battles are more costly; useful turns must earn enough progress to offset it.
         step_cost = -0.3
 
+        no_effect_move_penalty = 0.0
+        if prior_battle and self._last_move_had_no_effect(prior_battle, battle):
+            # A move with no observable effect should cost more than the
+            # ordinary turn cost, regardless of its category.
+            no_effect_move_penalty = -1.0
+
         # reward for win / loss
         victory_bonus = 0.0
         if battle.finished:
@@ -490,6 +597,9 @@ class ShowdownEnvironment(BaseShowdownEnv):
             np.clip(battle_progress, -10.0, 10.0)
             + damage_exchange_reward
             + step_cost
+            + (matchup_hold_reward if prior_battle else 0.0)
+            + (switch_reward if prior_battle else 0.0)
+            + no_effect_move_penalty
             + victory_bonus
         )
 
