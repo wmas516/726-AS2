@@ -382,7 +382,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
         faint_advantage = 0.5 * (opp_fainted - ally_fainted)
         tactical_advantage = (
             0.25 * self._stat_effect_potential(battle)
-            + 0.5 * self._status_potential(battle)
+            + 0.75 * self._status_potential(battle)
             + 0.25 * self._field_effect_potential(battle)
         )
         matchup_advantage = self._active_matchup_potential(battle)
@@ -461,18 +461,22 @@ class ShowdownEnvironment(BaseShowdownEnv):
                 battle.opponent_team,
                 known_members_only=True,
             )
-            # Reward favorable damage trades directly and penalize self-damage,
-            # including HP spent on moves such as Substitute.
+            # Value damage dealt to the opponent 1.5x, while penalizing our
+            # own HP loss (including Substitute) at the base rate.
             damage_exchange_reward = float(
-                np.clip(2.0 * (ally_hp_change - opponent_hp_change), -4.0, 4.0)
+                np.clip(
+                    2.0 * (ally_hp_change - 1.5 * opponent_hp_change),
+                    -4.0,
+                    4.0,
+                )
             )
         else:
             battle_progress = 0.0
             damage_exchange_reward = 0.0
 
-        # Charge every action a small time cost to discourage unnecessarily
-        # long battles, including turns where the state does not change.
-        step_cost = -0.1
+        # Charge every action a time cost so ineffective turns and drawn-out
+        # battles are more costly; useful turns must earn enough progress to offset it.
+        step_cost = -0.3
 
         # reward for win / loss
         victory_bonus = 0.0
