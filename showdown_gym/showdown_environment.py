@@ -76,6 +76,7 @@ class ShowdownEnvironment(BaseShowdownEnv):
         self.rl_agent = account_name_one
         self._prev_battle_state = {}
         self._last_action = None
+        self._blocked_moves = {}
         # self._active_damage_multiplier = 1.0
         # self._opponent_damage_multiplier = 1.0
 
@@ -115,6 +116,41 @@ class ShowdownEnvironment(BaseShowdownEnv):
             return np.int64(-2)
         self._last_action = action
         return np.int64(action)
+
+    def get_available_action_mask(self) -> np.ndarray:
+        """Mask a move after it failed, until the battle state changes."""
+        mask = np.ones(10, dtype=np.float32)
+        battle = self.battle1
+        if battle is None or battle.active_pokemon is None:
+            return mask
+
+        active_species = _condition_name(battle.active_pokemon.species)
+        current_signature = self._battle_effect_signature(battle)
+        available_moves = list(getattr(battle, "available_moves", []) or [])
+        for slot, move in enumerate(available_moves[:4]):
+            key = (active_species, _condition_name(getattr(move, "id", move)))
+            blocked_signature = self._blocked_moves.get(key)
+            if blocked_signature is None:
+                continue
+            if blocked_signature == current_signature:
+                mask[6 + slot] = 0.0
+            else:
+                # The relevant state changed, so the previously failed move
+                # may now have a useful effect.
+                del self._blocked_moves[key]
+
+        # Never mask every move when there is no switch option; keep the agent
+        # able to act if the only remaining choice is a previously failed move.
+        if available_moves and not np.any(mask[6 : 6 + min(4, len(available_moves))]):
+            switches = list(getattr(battle, "available_switches", []) or [])
+            if not switches:
+                mask[6 : 6 + min(4, len(available_moves))] = 1.0
+        return mask
+
+    def reset(self, seed=None, options=None):
+        self._last_action = None
+        self._blocked_moves.clear()
+        return super().reset(seed=seed, options=options)
 
     def _move_damage_multiplier(self, battle: AbstractBattle, move, opponent) -> float:
         """
@@ -441,12 +477,24 @@ class ShowdownEnvironment(BaseShowdownEnv):
             return effects
 
         def conditions(values):
-            return tuple(sorted(
-                (_condition_name(key), str(value))
-                for key, value in (values or {}).items()
-            ))
+            signature = []
+            for key, value in (values or {}).items():
+                name = _condition_name(key)
+                try:
+                    active = float(value) > 0
+                except (TypeError, ValueError):
+                    active = value is not False
+                if not active:
+                    continue
+                # Layer counts are meaningful for these hazards; duration
+                # counters on screens/Tailwind should not look like new effects.
+                layers = str(value) if name in ("spikes", "toxicspikes") else "active"
+                signature.append((name, layers))
+            return tuple(sorted(signature))
 
         return (
+            _condition_name(getattr(getattr(battle, "active_pokemon", None), "species", "")),
+            _condition_name(getattr(getattr(battle, "opponent_active_pokemon", None), "species", "")),
             team_effects(getattr(battle, "team", {})),
             team_effects(getattr(battle, "opponent_team", {})),
             conditions(getattr(battle, "side_conditions", {})),
@@ -580,10 +628,29 @@ class ShowdownEnvironment(BaseShowdownEnv):
         step_cost = -0.3
 
         no_effect_move_penalty = 0.0
-        if prior_battle and self._last_move_had_no_effect(prior_battle, battle):
+        controlled_battle = (
+            str(getattr(battle, "player_username", "")).lower()
+            == str(self.rl_agent).lower()
+        )
+        if (
+            prior_battle
+            and controlled_battle
+            and self._last_move_had_no_effect(prior_battle, battle)
+        ):
             # A move with no observable effect should cost more than the
             # ordinary turn cost, regardless of its category.
             no_effect_move_penalty = -1.0
+            action = self._last_action
+            moves = list(getattr(prior_battle, "available_moves", []) or [])
+            if action is not None and 6 <= action <= 9 and action - 6 < len(moves):
+                move = moves[action - 6]
+                active = getattr(prior_battle, "active_pokemon", None)
+                if active is not None:
+                    key = (
+                        _condition_name(getattr(active, "species", "")),
+                        _condition_name(getattr(move, "id", move)),
+                    )
+                    self._blocked_moves[key] = self._battle_effect_signature(battle)
 
         # reward for win / loss
         victory_bonus = 0.0
