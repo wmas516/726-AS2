@@ -77,8 +77,10 @@ class ShowdownEnvironment(BaseShowdownEnv):
         self._prev_battle_state = {}
         self._last_action = None
         self._blocked_moves = {}
-        # self._active_damage_multiplier = 1.0
-        # self._opponent_damage_multiplier = 1.0
+        # These values are logging metadata read during the first reset, before
+        # an active battle has been observed.
+        self._active_damage_multiplier = 1.0
+        self._opponent_damage_multiplier = 1.0
 
     # =========================================================
     # Action space
