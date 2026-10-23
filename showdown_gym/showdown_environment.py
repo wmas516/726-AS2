@@ -79,6 +79,24 @@ class ShowdownEnvironment(BaseShowdownEnv):
         # an active battle has been observed.
         self._active_damage_multiplier = 1.0
         self._opponent_damage_multiplier = 1.0
+        self._reset_episode_metrics()
+
+    def _reset_episode_metrics(self) -> None:
+        self._super_effective_moves = 0
+        self._turns_opponent_active_hp_not_decreased = 0
+        self._turns_agent_active_hp_not_decreased = 0
+        self._turns_agent_active_hit_super_effectively = 0
+        self._agent_switches = 0
+        self._total_damage_dealt = 0.0
+        self._total_damage_taken = 0.0
+
+    @staticmethod
+    def _team_hp_by_member(team) -> dict[str, float]:
+        """Return each team member's HP in HP points, keyed by its team identifier."""
+        return {
+            identifier: float(pokemon.current_hp_fraction) * float(pokemon.max_hp)
+            for identifier, pokemon in team.items()
+        }
 
     # =========================================================
     # Action space
@@ -120,7 +138,115 @@ class ShowdownEnvironment(BaseShowdownEnv):
         return np.ones(10, dtype=np.float32)
 
     def reset(self, seed=None, options=None):
+        self._reset_episode_metrics()
         return super().reset(seed=seed, options=options)
+
+    def step(self, actions):
+        battle_before = self.battle1
+        agent = self.possible_agents[0]
+        action = int(actions[agent])
+
+        # Action IDs 6-9 select move slots 0-3; IDs 0-5 are switches.
+        if battle_before is not None and 6 <= action <= 9:
+            moves = list(battle_before.available_moves or [])
+            move_slot = action - 6
+            opponent = battle_before.opponent_active_pokemon
+            if move_slot < len(moves) and opponent is not None:
+                move = moves[move_slot]
+                try:
+                    type_multiplier = move.type.damage_multiplier(
+                        opponent.type_1,
+                        getattr(opponent, "type_2", None),
+                        type_chart=GEN_DATA.type_chart,
+                    )
+                    if type_multiplier > 1.0:
+                        self._super_effective_moves += 1
+                except (AttributeError, TypeError, ValueError):
+                    pass
+
+        # BaseShowdownEnv snapshots the pre-step battle before it advances it.
+        result = super().step(actions)
+        previous = getattr(self, "_prior_battle_one", None)
+        current = self.battle1
+        if previous is None or current is None:
+            return result
+
+        previous_agent_hp = self._team_hp_by_member(previous.team)
+        current_agent_hp = self._team_hp_by_member(current.team)
+        previous_opponent_hp = self._team_hp_by_member(previous.opponent_team)
+        current_opponent_hp = self._team_hp_by_member(current.opponent_team)
+        self._total_damage_taken += sum(
+            max(0.0, previous_agent_hp[key] - current_agent_hp[key])
+            for key in previous_agent_hp.keys() & current_agent_hp.keys()
+        )
+        self._total_damage_dealt += sum(
+            max(0.0, previous_opponent_hp[key] - current_opponent_hp[key])
+            for key in previous_opponent_hp.keys() & current_opponent_hp.keys()
+        )
+
+        previous_agent = previous.active_pokemon
+        current_agent = current.active_pokemon
+        previous_opponent = previous.opponent_active_pokemon
+        current_opponent = current.opponent_active_pokemon
+
+        if previous_agent is not None and current_agent is not None:
+            same_agent = (
+                _condition_name(previous_agent.species)
+                == _condition_name(current_agent.species)
+            )
+            if not same_agent:
+                self._agent_switches += 1
+            elif current_agent.current_hp_fraction >= previous_agent.current_hp_fraction:
+                self._turns_agent_active_hp_not_decreased += 1
+
+        if previous_opponent is not None and current_opponent is not None:
+            same_opponent = (
+                _condition_name(previous_opponent.species)
+                == _condition_name(current_opponent.species)
+            )
+            if (
+                same_opponent
+                and current_opponent.current_hp_fraction
+                >= previous_opponent.current_hp_fraction
+            ):
+                self._turns_opponent_active_hp_not_decreased += 1
+
+        # Count an incoming super-effective move once for a battle turn. The
+        # opponent's last_move can persist between turns, so require the turn
+        # number to advance and both active Pokemon to have stayed in.
+        same_agent = (
+            previous_agent is not None
+            and current_agent is not None
+            and _condition_name(previous_agent.species)
+            == _condition_name(current_agent.species)
+        )
+        same_opponent = (
+            previous_opponent is not None
+            and current_opponent is not None
+            and _condition_name(previous_opponent.species)
+            == _condition_name(current_opponent.species)
+        )
+        incoming_move = getattr(current_opponent, "last_move", None)
+        if (
+            same_agent
+            and same_opponent
+            and current.turn > previous.turn
+            and incoming_move is not None
+            and getattr(incoming_move, "type", None) is not None
+            and current_agent.type_1 is not None
+        ):
+            try:
+                incoming_multiplier = incoming_move.type.damage_multiplier(
+                    current_agent.type_1,
+                    getattr(current_agent, "type_2", None),
+                    type_chart=GEN_DATA.type_chart,
+                )
+                if incoming_multiplier > 1.0:
+                    self._turns_agent_active_hit_super_effectively += 1
+            except (AttributeError, TypeError, ValueError):
+                pass
+
+        return result
 
     def _move_damage_multiplier(self, battle: AbstractBattle, move, opponent) -> float:
         """
@@ -542,8 +668,19 @@ class ShowdownEnvironment(BaseShowdownEnv):
             agent = self.possible_agents[0]
             info[agent]["win"] = self.battle1.won
             info[agent]["turns"] = self.battle1.turn
-            info[agent]["active_damage_multiplier"] = self._active_damage_multiplier
-            info[agent]["opponent_damage_multiplier"] = self._opponent_damage_multiplier
+            info[agent]["super_effective_moves"] = self._super_effective_moves
+            info[agent]["turns_opponent_active_hp_not_decreased"] = (
+                self._turns_opponent_active_hp_not_decreased
+            )
+            info[agent]["turns_agent_active_hp_not_decreased"] = (
+                self._turns_agent_active_hp_not_decreased
+            )
+            info[agent]["turns_agent_active_hit_super_effectively"] = (
+                self._turns_agent_active_hit_super_effectively
+            )
+            info[agent]["agent_switches"] = self._agent_switches
+            info[agent]["total_damage_dealt"] = self._total_damage_dealt
+            info[agent]["total_damage_taken"] = self._total_damage_taken
         return info
 
 
